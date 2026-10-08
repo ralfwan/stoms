@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>STOMS ledger</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6' fill='%232759c4'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="topbar">
+  <button id="sidebar-toggle" class="sidebar-toggle" type="button" aria-controls="sidebar"
+          aria-expanded="true" title="Hide sidebar">&#9776;</button>
+  <a class="brand" href="#/">STOMS</a>
+  <span class="ledger" id="ledger-label"></span>
+</header>
+<div class="layout">
+  <nav class="sidebar" id="sidebar">
+    <input id="agg-filter" type="search" placeholder="Filter aggregations"
+           aria-label="Filter aggregations">
+    <ul id="agg-list" class="agg-list"></ul>
+  </nav>
+  <main id="main"><p class="muted">Loading&hellip;</p></main>
+</div>
+<script src="viewer.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: stoms_test
+      POSTGRES_PASSWORD: stoms
+      POSTGRES_USER: stoms
+    ports:
+      - "54329:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stoms -d stoms_test"]
+      interval: 2s
+      timeout: 5s
+      retries: 15

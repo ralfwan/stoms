@@ -1,0 +1,15 @@
+site_name: STOMS
+site_description: SQLite-first immutable storage for ASE structures and evaluations
+repo_name: stoms
+exclude_docs: README.md
+theme:
+  name: readthedocs
+nav:
+  - Overview: index.md
+  - Researcher quick start: researcher-guide.md
+  - Getting started: getting-started.md
+  - PostgreSQL operational ledger: postgres.md
+  - Use cases and boundaries: use-cases.md
+  - Public API: api.md
+  - VASP parser: vasp-parser.md
+  - Limitations: limitations.md
