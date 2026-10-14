@@ -1,0 +1,79 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "stoms"
+version = "0.5.0"
+description = "SQLite-first immutable storage for ASE structures and evaluations"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Ralf Wanzenboeck", email = "ralf.wanzenboeck@tuwien.ac.at" }]
+dependencies = [
+    "ase>=3.24",
+    "ipykernel>=7.3.0",
+    "numpy>=1.26",
+]
+
+[project.urls]
+Homepage = "https://github.com/ralfwan/stoms"
+Repository = "https://github.com/ralfwan/stoms"
+Documentation = "https://ralfwan.github.io/stoms/"
+
+[project.scripts]
+stoms = "stoms.cli:main"
+
+[project.optional-dependencies]
+postgres = [
+    "psycopg[binary]>=3.2",
+]
+vasp = [
+    "pymatgen>=2025.1",
+]
+
+[dependency-groups]
+dev = [
+    "pymatgen>=2025.1",
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "pre-commit>=4.6.0",
+    "ruff>=0.9",
+    "mypy>=1.13",
+]
+docs = [
+    "mkdocs>=1.6",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/stoms"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 79
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["stoms"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = false
+exclude = [
+    "\\.venv/",
+    "build/",
+    "src/stoms/atomsledger/backends/(hdf5|postgres)\\.py$",
+]
+packages = ["stoms.atomsledger"]
+
+[[tool.mypy.overrides]]
+module = "h5py"
+ignore_missing_imports = true
