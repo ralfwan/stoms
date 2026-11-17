@@ -1,0 +1,958 @@
+"use strict";
+
+// The viewer outside the ledger pages: one structure panel of viewer.js with a
+// compact toolbar, for notebooks (stoms.viewer.view) and saved HTML files.
+//
+// Reads STOMS_EMBED (see stoms/viewer/document.py):
+//   { frames, frame, settings, camera, profile, title, bridge, height, api, measurements }
+// frames are structure JSON as the ledger server sends it (id, symbols,
+// positions, cell, pbc, arrays, properties); settings are viewerPrefs (the
+// format of the viewer's settings files); camera is sharedView { R, scale, pan };
+// profile the controls shown ("simple" or "advanced", see applyProfile; not a
+// setting).
+//
+// In an iframe, the page posts its height to the parent window. With
+// `bridge` it also talks to the notebook widget (stoms/viewer/widget.js):
+//   parent -> page: { stoms, type: "state", frame?, settings?, camera?, profile? }
+//                   { stoms, type: "view", name }
+//                   { stoms, type: "profile", profile }
+//                   { stoms, type: "api", id, data | error }
+//   page -> parent: { stoms, type: "ready" }
+//                   { stoms, type: "api", id, path }
+//                   { stoms, type: "size", height }
+//                   { stoms, type: "snapshot", state: { frame, settings, camera }, svg, measurements }
+//                   { stoms, type: "profile", profile }   (switched in the page)
+// A snapshot follows every change once drawing settles: the SVG Python saves
+// is the one drawn for exactly that state.
+//
+// What the ledger server computes on request (phonons: modes at any q, bands,
+// DOS) the page asks for with api(path) as on the server; Python answers over
+// the bridge. Replies are kept (`api`, by path), also in pop-out copies, which
+// have no kernel to ask.
+//
+// Uses dom.js (el, formatNumber) and viewer.js (createPanel, viewerPrefs,
+// sharedView, normalizePrefs, panelsToSvg, presetRotation, axisRotation, ...).
+
+(() => {
+  const data = STOMS_EMBED;
+  // The page as loaded, before anything is drawn; the pop-out tab and saved
+  // HTML files are copies of it with the current state.
+  const pristine = `<!doctype html>\n${document.documentElement.outerHTML}`;
+  const frames = data.frames;
+  const framed = window.parent !== window;
+  const bridge = Boolean(data.bridge) && framed;
+  const post = (message) => { if (framed) window.parent.postMessage({ stoms: true, ...message }, "*"); };
+  const clampFrame = (i) => Math.max(0, Math.min(frames.length - 1, Math.round(Number(i)) || 0));
+  let index = clampFrame(data.frame);
+
+  // viewer.js asks for data with api(path), answered here instead of by a server.
+  const replies = new Map(Object.entries(data.api ?? {}));
+  const waiting = new Map();
+  let requests = 0;
+  const API_TIMEOUT = 300_000;
+  const copy = (value) => JSON.parse(JSON.stringify(value));
+  globalThis.api = (path) => {
+    if (replies.has(path)) return Promise.resolve(copy(replies.get(path)));
+    if (!bridge) {
+      return Promise.reject(new Error("This is computed in Python: open the viewer in its notebook, with the kernel running."));
+    }
+    const id = ++requests;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        waiting.delete(id);
+        reject(new Error("No answer from Python: is the notebook's kernel running?"));
+      }, API_TIMEOUT);
+      waiting.set(id, { path, resolve, reject, timer });
+      post({ type: "api", id, path });
+    });
+  };
+  function replied(m) {
+    const request = waiting.get(m.id);
+    if (!request) return;
+    waiting.delete(m.id);
+    clearTimeout(request.timer);
+    if (m.error !== undefined && m.error !== null) { request.reject(new Error(m.error)); return; }
+    replies.set(request.path, m.data);
+    request.resolve(copy(m.data));
+  }
+  document.body.classList.toggle("embed-standalone", !framed);
+  if (data.title) document.title = data.title;
+
+  // ------------------------------------------------------------ settings & camera
+
+  // Bond cutoffs for every element pair in the frames, as on the structure page.
+  const species = [...new Set(frames.flatMap((f) => f.symbols))].sort();
+  const fillCutoffs = (prefs) => {
+    for (const a of species) for (const b of species) prefs.cutoffs[pairKey(a, b)] ??= defaultCutoff(a, b);
+    return prefs;
+  };
+  fillCutoffs(viewerPrefs);
+  const replacePrefs = (next) => {
+    for (const key of Object.keys(viewerPrefs)) delete viewerPrefs[key];
+    Object.assign(viewerPrefs, next);
+  };
+
+  const finite = (v) => typeof v === "number" && Number.isFinite(v);
+  const isRotation = (R) => Array.isArray(R) && R.length === 3 && R.every((row) => Array.isArray(row) && row.length === 3 && row.every(finite));
+  const isOrthonormal = (R) => R.every((row, i) => R.every((other, j) => Math.abs(dot(row, other) - (i === j ? 1 : 0)) < 1e-9));
+  const cameraState = () => ({
+    R: sharedView.R ? sharedView.R.map((row) => [...row]) : null,
+    scale: sharedView.scale, pan: [...sharedView.pan],
+  });
+  // A camera without a usable rotation means the default: top view, fitted.
+  function applyCamera(camera) {
+    if (camera && isRotation(camera.R)) {
+      sharedView.R = isOrthonormal(camera.R) ? camera.R.map((row) => [...row]) : orthonormalize(camera.R);
+      sharedView.scale = finite(camera.scale) && camera.scale > 0 ? camera.scale : null;
+      sharedView.pan = Array.isArray(camera.pan) && camera.pan.length === 2 && camera.pan.every(finite) ? [...camera.pan] : [0, 0];
+    } else {
+      Object.assign(sharedView, { R: null, scale: null, pan: [0, 0] });
+    }
+  }
+  applyCamera(data.camera);
+
+  const exportOptions = () => ({ transparent: viewerPrefs.svgTransparent, tripod: viewerPrefs.tripod.export });
+  const fileStem = () => `${frames[index].formula}${frames.length > 1 ? `-frame${index}` : ""}`;
+
+  // ------------------------------------------------------------ layout
+
+  const root = document.getElementById("stoms-root");
+  const host = el("div", { class: "viewer-panel embed-panel" });
+  const panel = createPanel(host);
+  // The structure, and a phonon plot below or beside it (as on the structure page).
+  const figures = el("div", { class: "viewer-figures" }, host);
+  const bar = el("div", { class: "embed-bar", role: "toolbar", "aria-label": "Viewer" });
+  // Boxes a jump to a control may open (data-profile-place: see controlPlace).
+  const vibrationBox = el("div", { class: "viewer-controls embed-vibrations", hidden: true, "data-profile-place": "Vibrations" });
+  const measureBox = el("div", { class: "viewer-controls embed-measure", hidden: true, "data-profile-place": "📏" });
+  const settingsBox = el("div", { class: "embed-settings", hidden: true, "data-profile-place": "⚙" });
+  const status = el("div", { class: "embed-status muted" });
+  // What a click on an atom does while measuring (as on the structure page).
+  const clickMode = el("div", { class: "click-mode", role: "status" });
+  // Colour scale or categories of a property colouring.
+  const legend = el("div", { class: "viewer-legend embed-legend" });
+  root.append(clickMode, figures, legend, bar, measureBox, vibrationBox, settingsBox, status);
+  // Every drawing of the scene (also a vibrating mode) is followed by a snapshot.
+  const rebuildPanel = panel.rebuild;
+  panel.rebuild = () => { rebuildPanel(); changed(); };
+
+  // Settings controls register here how they show viewerPrefs (after imports
+  // and changes from Python).
+  const syncs = [];
+  const sync = () => syncs.forEach((f) => f());
+  // Controls that are rebuilt only when the settings change from outside
+  // (Python, an imported file): rebuilding them after their own changes
+  // would close an open colour picker.
+  const externals = [];
+  const syncExternal = () => externals.forEach((f) => f());
+
+  function applySize() {
+    const { width, height } = viewerPrefs.panelSize;
+    panel.stage.style.height = height ? `${height}px` : framed ? `${data.height || 440}px` : "";
+    panel.stage.style.width = width ? `${width}px` : "";
+    host.classList.toggle("fixed-width", Boolean(width));
+  }
+
+  // Tooltip: element, index and height as on the structure page, then the
+  // atom's values of up to four per-atom arrays (charges, forces, ...).
+  const arrayText = (array, i) => {
+    const v = array.values[i];
+    if (array.kind === "vector") return v.includes(null) ? "–" : `${formatNumber(norm(v))} (|v|)`;
+    return valueText(v);
+  };
+  function overlayFor(s) {
+    const hs = heights(s);
+    const shown = (s.arrays ?? []).slice(0, 4);
+    return {
+      colour: (i, symbol) => elementColor(symbol),
+      describe: (i) => [[s.symbols[i], `atom ${i}`], [`${hs[i].toFixed(2)} Å`, "height"],
+        ...shown.map((a) => [arrayText(a, i), a.unit ? `${a.name} (${a.unit})` : a.name])],
+    };
+  }
+
+  function propertyText(p) {
+    const value = Array.isArray(p.value) ? `[${p.value.map((v) => (v === null ? "–" : formatNumber(v))).join(", ")}]`
+      : typeof p.value === "number" ? String(Number(p.value.toPrecision(10))) : String(p.value);
+    return `${p.name} = ${value}${p.unit ? ` ${p.unit}` : ""}`;
+  }
+  function renderStatus() {
+    const s = frames[index];
+    const scene = panel.scene;
+    const energy = (s.properties ?? []).find((p) => p.source === "calculator" && p.name === "energy")
+      ?? (s.properties ?? []).find((p) => p.name === "energy");
+    status.textContent = [
+      `${s.formula} · ${s.symbols.length} atoms`,
+      `pbc ${s.pbc.map((p) => (p ? "T" : "F")).join("")}`,
+      energy ? propertyText(energy) : null,
+      symmetryStatus(s),
+      viewerPrefs.singleCell && s.pbc.some(Boolean) ? "single cell only" : null,
+      viewerPrefs.repeatMatrix ? transformStatus(s) : null,
+      scene?.extraAtoms ? `${scene.extraAtoms} bonded atoms outside` : null,
+      scene && scene.totalAtoms > LARGE_SCENE
+        ? `a large repeat: drawing may be slow${viewerPrefs.style === "wireframe" ? "" : " (⚙ › Model › Wireframe draws fastest)"}` : null,
+      displacing() ? displacementText(s) : null,
+      colourNotes || null,
+    ].filter(Boolean).join(" · ");
+  }
+  // A transformation matrix in the status line (display only).
+  function transformStatus(s) {
+    const shown = shownCell(s, []);
+    return shown.transformed ? `cell transformed by ${matrixRowsText(shown.matrix)} (${shown.copies} copies; display only)`
+      : `transformation matrix not applied: ${shown.note}`;
+  }
+  // Space group of the shown frame (embedded by Python, or asked for at
+  // another tolerance), for the status line; null when unknown.
+  function symmetryStatus(s) {
+    const sym = symmetryNow(s);
+    return sym?.number != null ? `${spaceGroupText(sym)}, ${sym.crystal_system}` : null;
+  }
+  // Symmetry at a tolerance the frame does not carry: ask Python (a linked
+  // widget answers; a saved page cannot).
+  let symmetryError = "";
+  function ensureSymmetry(s) {
+    symmetryError = "";
+    if (!symmetryAvailable(s) || symmetryNow(s)) return;
+    loadSymmetry(s).then(() => {
+      if (frames[index] === s) { renderStatus(); sync(); }
+    }, (error) => {
+      if (frames[index] === s) { symmetryError = error.message; sync(); }
+    });
+  }
+  // RMSD and the largest displacement of the shown frame, or why there are none.
+  function displacementText(s) {
+    const d = displacementNow(s);
+    if (!d.vectors) return d.reason ?? "Δr: this frame is the reference";
+    return [`Δr RMSD ${d.rmsd.toFixed(3)} Å`, `max ${d.max.toFixed(3)} Å (atom ${d.maxIndex})`,
+      d.cellsDiffer ? "cells differ: reference mapped by fractional coordinates" : null].filter(Boolean).join(" · ");
+  }
+
+  // ------------------------------------------------------------ force arrows
+
+  // Per-atom vectors of the frames that can be drawn as arrows: calculator
+  // forces first, then other 3-vector columns (extxyz REF_forces, ...). The
+  // choice is viewerPrefs.forceChoice ({ source, name }), as a setting.
+  const vectorChoices = (() => {
+    const found = new Map();
+    for (const f of frames) for (const a of f.arrays ?? []) {
+      if (a.kind === "vector" && !found.has(`${a.source}:${a.name}`)) found.set(`${a.source}:${a.name}`, { source: a.source, name: a.name, unit: a.unit ?? null });
+    }
+    return [...found.values()].sort((a, b) => (b.source === "calculator") - (a.source === "calculator") || (b.name === "forces") - (a.name === "forces"));
+  })();
+  const chosenVector = () => {
+    const c = viewerPrefs.forceChoice;
+    return vectorChoices.find((v) => c && v.source === c.source && v.name === c.name) ?? vectorChoices[0] ?? null;
+  };
+  const vectorArray = (s, choice) => (choice ? (s.arrays ?? []).find((a) => a.kind === "vector" && a.source === choice.source && a.name === choice.name) : null);
+
+  // Displacements from a reference frame (viewerPrefs.displacement: the
+  // first, the previous or a chosen frame); a notebook has no compared
+  // structure. They need two frames.
+  const canDisplace = frames.length > 1;
+  // What the control rules ask about this viewer (controlContext in
+  // viewer.js): all its frames, as the settings box shows controls for any of them.
+  globalThis.embedControlContext = () => controlContext(frames, { frames: frames.length, hasVectors: vectorChoices.length > 0, canDisplace,
+    measurements: measureState.items.length, polyhedra: measureState.polyhedra.length });
+  // { reference } (s itself for the reference frame: zero displacements) or
+  // { reference: null, reason }.
+  function referenceOf(s) {
+    const { reference, frame } = viewerPrefs.displacement;
+    if (reference === "compared") {
+      return { reference: null, reason: "A notebook viewer has no compared structure: choose a frame as the reference (⚙ › Arrows)." };
+    }
+    const i = frames.indexOf(s);
+    let ref;
+    if (reference === "previous") {
+      if (i < 0) return { reference: null, reason: "Not one of the frames." };
+      if (i === 0) return { reference: null, reason: "The first frame has no previous frame." };
+      ref = frames[i - 1];
+    } else {
+      ref = frames[reference === "frame" ? Math.min(frame, frames.length - 1) : 0];
+    }
+    return { reference: ref };
+  }
+  displacementReference = async (s) => referenceOf(s);
+  // displacementOf for s, or { reason } (as displacementFor in viewer.js, but at once).
+  function displacementNow(s) {
+    const { reference, reason } = referenceOf(s);
+    if (!reference) return { reason };
+    const d = displacementOf(s, reference);
+    return d.error ? { reason: `No displacements: ${d.error}.` } : d;
+  }
+  // What the arrows show: the chosen vectors or displacements (the only
+  // choice without vectors; impossible with one frame).
+  const arrowSource = () => {
+    if (!canDisplace) return "vectors";
+    return vectorChoices.length ? viewerPrefs.arrows.source : "displacement";
+  };
+  const displacing = () => {
+    const choice = viewerPrefs.property.choice;
+    return canDisplace && ((viewerPrefs.arrows.show && arrowSource() === "displacement")
+      || (colouring() && choice?.source === "derived" && choice.name === "displacement"));
+  };
+
+  // What buildScene draws arrows from (and the tooltip shows), or null.
+  function forcesFor(s) {
+    if (!viewerPrefs.arrows.show) return null;
+    if (arrowSource() === "displacement") {
+      const d = displacementNow(s);
+      if (!d.vectors) return null;
+      return { vectors: d.vectors, magnitudes: d.magnitudes, included: forceIncluded(s), unit: "Å", name: "displacement" };
+    }
+    const array = vectorArray(s, chosenVector());
+    if (!array) return null;
+    const vectors = array.values.map((v) => v.map((c) => c ?? 0));
+    return { vectors, magnitudes: vectors.map(norm), included: forceIncluded(s), unit: array.unit ?? null, name: array.name };
+  }
+  // Auto length: the largest included vector of all frames becomes a 1.5 Å arrow.
+  function autoArrowScale() {
+    const displacements = arrowSource() === "displacement";
+    const choice = chosenVector();
+    let max = 0;
+    for (const f of frames) {
+      const values = displacements ? displacementNow(f).vectors : vectorArray(f, choice)?.values;
+      if (!values) continue;
+      const included = forceIncluded(f);
+      values.forEach((v, i) => { if (included[i] && !v.includes(null)) max = Math.max(max, norm(v)); });
+    }
+    return max > 1e-9 ? Number((1.5 / max).toPrecision(2)) : null;
+  }
+
+  // ------------------------------------------------------------ measurements
+
+  // Measurements from Python or a copied page (see measureState and
+  // validMeasurements in viewer.js).
+  measureState.items = validMeasurements(Array.isArray(data.measurements) ? data.measurements : []);
+  const measure = createMeasurePanel({ structures: () => [frames[index]], panels: () => [panel], stages: figures, clickMode, where: "📏" });
+  measureBox.append(el("h3", {}, "Measure"), measure.controls);
+  // Measurements with their values on the shown frame, for Python.
+  const measurementsNow = () => measureState.items.map((item) => {
+    const s = frames[index];
+    const value = fitsStructure(s, measureRefs(item)) ? measureValue(s, item) : null;
+    return { kind: item.kind, atoms: item.atoms, ...(item.planes ? { planes: item.planes } : {}),
+      value: value?.value ?? null, nearest: value?.nearest ?? null };
+  });
+
+  // ------------------------------------------------------------ colour by property
+
+  // Properties of every frame (propertyOptions): per-atom arrays, calculator
+  // results and values from the geometry. Ring sizes need the ledger
+  // server's ring analysis and are left out, displacements a second frame.
+  const colourOptions = (() => {
+    const found = new Map();
+    for (const f of frames) for (const o of propertyOptions(f)) {
+      if (o.choice.source === "derived" && (o.choice.name === "ring" || (o.choice.name === "displacement" && !canDisplace))) continue;
+      if (!found.has(o.key)) found.set(o.key, o);
+    }
+    return [...found.values()];
+  })();
+  const colouring = () => viewerPrefs.colour === "property";
+  // One colour scale for all frames (as for a movie on the structure page).
+  async function propertyRange() {
+    const { choice, component } = viewerPrefs.property;
+    const ranges = await Promise.all(frames.map(async (f) => extent(shownNumbers(f, await propertyValues(f, choice, component)))));
+    return ranges.reduce(([lo, hi], [a, b]) => [Math.min(lo, a), Math.max(hi, b)], [Infinity, -Infinity]);
+  }
+  let colourToken = 0;
+  let colourNotes = "";
+  // The shown frame in property colours (async: values may be loading).
+  async function colourByProperty(s) {
+    const token = ++colourToken;
+    const result = await propertyOverlays({ structures: [s], range: propertyRange, current: () => token === colourToken && frames[index] === s });
+    if (!result) return;
+    panel.overlay = result.overlays[0];
+    legend.replaceChildren(...result.legend);
+    colourNotes = result.notes.join(" ");
+    panel.rebuild();
+    renderStatus();
+  }
+
+  // ------------------------------------------------------------ drawing and state
+
+  let snapshotTimer = 0;
+  let lastSnapshot = "";
+  function changed() {
+    if (!bridge) return;
+    clearTimeout(snapshotTimer);
+    snapshotTimer = setTimeout(sendSnapshot, 200);
+  }
+  function sendSnapshot() {
+    if (!panel.scene || !panel.stage.clientWidth || !sharedView.R) return;
+    const state = { frame: index, settings: JSON.parse(JSON.stringify(viewerPrefs)), camera: cameraState() };
+    const svg = panelsToSvg([panel], exportOptions());
+    const measurements = measurementsNow();
+    const key = `${JSON.stringify(state)}\n${JSON.stringify(measurements)}\n${svg}`;
+    if (key === lastSnapshot) return;
+    lastSnapshot = key;
+    post({ type: "snapshot", state, svg, measurements });
+  }
+
+  function showFrame(i) {
+    index = clampFrame(i);
+    const s = frames[index];
+    panel.structure = s;
+    panel.forces = forcesFor(s);
+    if (colouring()) {
+      colourByProperty(s);
+    } else {
+      colourToken += 1;
+      colourNotes = "";
+      panel.overlay = overlayFor(s);
+      legend.replaceChildren();
+    }
+    // Until property colours have loaded, the frame keeps its last colours.
+    panel.overlay ??= overlayFor(s);
+    ensureSymmetry(s);
+    panel.rebuild();
+    measure.render();
+    sync();
+    renderStatus();
+    changed();
+  }
+  // Everything again after the settings changed.
+  let refreshFrame = 0;
+  function refresh() {
+    cancelAnimationFrame(refreshFrame);
+    refreshFrame = requestAnimationFrame(() => { applySize(); showFrame(index); });
+  }
+  // viewer.js calls this whenever a setting changes (savePrefs).
+  data.saved = refresh;
+
+  sharedView.listeners.clear();
+  sharedView.listeners.add(() => { panel.draw(); changed(); });
+  // The first draw (once the panel has a size) fits the view.
+  new ResizeObserver(() => changed()).observe(panel.stage);
+
+  // Looks: "top", "side-a", "side-b" or an axis ("a", ..., "z"; "-c" from
+  // the other side), as on the structure page.
+  const hasCellAxis = (s, k) => norm(s.cell[k]) > 1e-8;
+  function setView(name, animate = true) {
+    const s = frames[index];
+    const opposite = typeof name === "string" && name.startsWith("-");
+    const axis = opposite ? name.slice(1) : name;
+    let R;
+    if (["top", "side-a", "side-b"].includes(axis)) R = presetRotation(s, axis);
+    else if (["x", "y", "z"].includes(axis) || (["a", "b", "c"].includes(axis) && hasCellAxis(s, "abc".indexOf(axis)))) R = axisRotation(s, axis, opposite);
+    else return;
+    if (animate) animateView(R);
+    else { sharedView.R = R; viewChanged(); }
+  }
+  function fit() {
+    panel.fit();
+    viewChanged();
+  }
+
+  // ------------------------------------------------------------ toolbar
+
+  const button = (label, title, onclick, cls = "") => el("button", { type: "button", class: `small ${cls}`.trim(), title, "aria-label": title, onclick }, label);
+  const group = (...children) => el("span", { class: "group" }, ...children);
+  // A checkbox for viewerPrefs[key] (or viewerPrefs[key][sub]).
+  function check(label, key, title, sub = null) {
+    const read = () => (sub ? viewerPrefs[key][sub] : viewerPrefs[key]);
+    const input = el("input", { type: "checkbox", onchange: () => {
+      if (sub) viewerPrefs[key][sub] = input.checked; else viewerPrefs[key] = input.checked;
+      savePrefs();
+    } });
+    syncs.push(() => { input.checked = read(); });
+    return el("label", { class: "check", title }, input, label);
+  }
+  // A slider for viewerPrefs[group][key] (opacities, the tripod's sizes and
+  // others).
+  const percent = (value) => `${Math.round(value * 100)}%`;
+  function appearanceSlider(label, key, { min = 0, max = 1, step = 0.05, format = percent, group = "appearance" } = {}) {
+    const output = el("output", { class: "muted" });
+    const show = () => { output.textContent = format(Number(viewerPrefs[group][key])); };
+    const input = el("input", { type: "range", min, max, step, "aria-label": label,
+      oninput: () => { viewerPrefs[group][key] = Number(input.value); show(); savePrefs(); } });
+    syncs.push(() => { input.value = viewerPrefs[group][key]; show(); });
+    return field(label, el("span", { class: "inline-fields" }, input, output));
+  }
+
+  // Frames: step, slider, number, play.
+  let player = 0;
+  const playButton = tagControl(button("▶", "Play the frames", () => (player ? stop() : play()), "play"), "frames.play");
+  function play() {
+    if (frames.length < 2) return;
+    if (index === frames.length - 1) showFrame(0);
+    playButton.textContent = "⏸";
+    playButton.title = "Pause";
+    const fps = Math.max(1, Math.min(60, Number(viewerPrefs.player.fps) || 10));
+    player = setInterval(() => {
+      if (index + 1 < frames.length) showFrame(index + 1);
+      else if (viewerPrefs.player.loop) showFrame(0);
+      else stop();
+    }, 1000 / fps);
+  }
+  function stop() {
+    clearInterval(player);
+    player = 0;
+    playButton.textContent = "▶";
+    playButton.title = "Play the frames";
+  }
+  const step = (delta) => { stop(); showFrame(index + delta); };
+  if (frames.length > 1) {
+    const slider = el("input", { type: "range", class: "frame-slider", min: 0, max: frames.length - 1, step: 1, "aria-label": "Frame", "data-control": "frames.slider",
+      oninput: () => { stop(); showFrame(Number(slider.value)); } });
+    const number = el("input", { type: "number", class: "num-input frame-number", min: 0, max: frames.length - 1, step: 1, "aria-label": "Frame number", "data-control": "frames.number",
+      onchange: () => { stop(); showFrame(Number(number.value)); } });
+    syncs.push(() => { slider.value = index; number.value = index; });
+    bar.append(group(tagControl(button("◀", "Previous frame (←)", () => step(-1)), "frames.step"), slider,
+      tagControl(button("▶", "Next frame (→)", () => step(1)), "frames.step"),
+      number, el("span", { class: "muted", "data-control": "frames.number" }, `/ ${frames.length - 1}`), playButton));
+  }
+
+  const anyPeriodic = frames.some((f) => f.pbc.some(Boolean));
+  const atomSize = el("input", { type: "range", min: 0.3, max: MAX_ATOM_SCALE, step: 0.05, "aria-label": "Atom size",
+    oninput: () => { viewerPrefs.appearance.atomScale = Number(atomSize.value); savePrefs(); } });
+  syncs.push(() => { atomSize.value = viewerPrefs.appearance.atomScale; });
+  const viewSelect = el("select", { "aria-label": "View along", title: "Look along a direction", "data-control": "view.preset",
+    onchange: () => { setView(viewSelect.value); viewSelect.value = ""; } },
+  el("option", { value: "" }, "View…"),
+  [["top", "Top"], ["side-a", "Side (a)"], ["side-b", "Side (b)"], ["a", "Along a"], ["b", "Along b"], ["c", "Along c"],
+    ["x", "Along x"], ["y", "Along y"], ["z", "Along z"]].map(([value, label]) =>
+    // The options along an axis are a control of their own (view.along).
+    el("option", { value, "data-control": "abcxyz".includes(value) ? "view.along" : null }, label)));
+  // Colour: element colours, or the property chosen under ⚙ › Colour atoms.
+  const colourSelect = el("select", { "aria-label": "Colour atoms by", "data-control": "colour.mode", title: "Colour atoms by element or by a per-atom property (⚙ for which)",
+    onchange: () => { viewerPrefs.colour = colourSelect.value; savePrefs(); } },
+  el("option", { value: "element" }, "Elements"), el("option", { value: "property" }, "Property"));
+  syncs.push(() => { colourSelect.value = colouring() ? "property" : "element"; });
+  const measureButton = tagControl(button("📏", "Measure distances, angles and dihedrals, plane angles and distances to a plane; coordination polyhedra", () => {
+    measureBox.hidden = !measureBox.hidden;
+    measureButton.classList.toggle("active", !measureBox.hidden);
+  }), "embed.measure-toggle");
+  const settingsButton = tagControl(button("⚙", "More settings", () => {
+    settingsBox.hidden = !settingsBox.hidden;
+    settingsButton.classList.toggle("active", !settingsBox.hidden);
+    // Controls kept because they were in use go once ⚙ is closed (as on
+    // leaving a tab of the structure page).
+    if (settingsBox.hidden) { profileView.keep.clear(); profileView.apply(); }
+  }), "embed.settings-toggle");
+  // Settings that do nothing in the drawing style are disabled (styleLocks).
+  const lockable = (label, lock) => {
+    label.dataset.title ??= label.title;
+    label.querySelector("input, select").disabled = Boolean(lock);
+    label.title = lock ?? label.dataset.title;
+    label.classList.toggle("muted", Boolean(lock));
+  };
+  const bondsCheck = tagControl(check("Bonds", "bonds", "Bonds (ball and stick)"), "bonds.show");
+  syncs.push(() => lockable(bondsCheck, styleLocks().bonds));
+  // The atom size factor applies only to ball and stick.
+  const sizeLabel = el("label", { class: "group", title: "Atom size (automatic radii)", "data-control": "appearance.atom-scale" }, "Size", atomSize);
+  syncs.push(() => lockable(sizeLabel, styleLocks().atomScale));
+  // Wrap: single cell only wraps anyway (SINGLE_CELL_LOCK in viewer.js).
+  const wrapCheck = anyPeriodic ? tagControl(check("Wrap", "wrap", "Draw every atom inside the cell"), "cell.wrap") : null;
+  // Shown ticked while single cell only is on (atoms are wrapped); the
+  // stored setting is kept.
+  if (wrapCheck) {
+    syncs.push(() => {
+      wrapCheck.querySelector("input").checked = viewerPrefs.singleCell || viewerPrefs.wrap;
+      lockable(wrapCheck, singleCellLock());
+    });
+  }
+  bar.append(
+    group(tagControl(check("Cell", "cell", "Unit cell outline"), "cell.outline"), bondsCheck,
+      wrapCheck,
+      tagControl(vectorChoices.length ? check("Arrows", "arrows", `Force arrows (per-atom vectors${canDisplace ? " or displacements" : ""}; ⚙ for their style)`, "show")
+        : canDisplace ? check("Arrows", "arrows", "Displacement arrows (⚙ for the reference and their style)", "show") : null, "arrows.show")),
+    sizeLabel,
+    el("label", { class: "group", "data-control": "colour.mode" }, "Colour", colourSelect),
+    group(viewSelect, tagControl(button("Fit", "Fit the structure into the panel", fit), "view.fit")),
+    el("span", { class: "spacer" }),
+    group(tagControl(button("Save SVG", "Save the view as an SVG (vector) image", saveSvg), "save.svg"),
+      tagControl(button("⧉", "Open this view in a new browser tab", popOut), "embed.pop-out"), measureButton, settingsButton));
+
+  function saveSvg() {
+    if (!panel.scene) return;
+    downloadText(`${fileStem()}.svg`, panelsToSvg([panel], exportOptions()), "image/svg+xml");
+  }
+
+  // ------------------------------------------------------------ settings box
+
+  const field = (label, control, title) => el("label", { class: "field", title }, el("span", { class: "field-label" }, label), control);
+  const fieldset = (legend, ...children) => el("fieldset", {}, el("legend", {}, legend), ...children);
+  function choice(label, options, read, write) {
+    const select = el("select", { "aria-label": label, onchange: () => { write(select.value); savePrefs(); } },
+      options.map(([value, text]) => el("option", { value }, text)));
+    syncs.push(() => { select.value = read(); });
+    return field(label, select);
+  }
+  // Repeat along the periodic axes of the shown frame.
+  const repeatInputs = [0, 1, 2].map((k) => {
+    const input = el("input", { type: "number", class: "num-input", min: 1, max: MAX_REPEAT, step: 1, "aria-label": `Repeat ${"abc"[k]}`,
+      onchange: () => { viewerPrefs.repeat[k] = clampRepeat(input.value); savePrefs(); } });
+    syncs.push(() => {
+      // Single cell only: shown as 1 (the stored repeat is kept).
+      input.value = viewerPrefs.singleCell ? 1 : viewerPrefs.repeat[k];
+      // A transformation matrix replaces the repeat, single cell only both
+      // (see shownCell).
+      input.disabled = !frames[index].pbc[k] || Boolean(viewerPrefs.repeatMatrix) || viewerPrefs.singleCell;
+      input.title = singleCellLock() ?? (viewerPrefs.repeatMatrix ? "The transformation matrix sets the shown cell" : "");
+    });
+    return input;
+  });
+  // The transformation matrix (createRepeatMatrixControls); saving the
+  // settings redraws.
+  const repeatMatrix = createRepeatMatrixControls({ structure: () => frames[index], onChange: () => {} });
+  syncs.push(repeatMatrix.sync);
+  // Single cell only (viewerPrefs.singleCell; SINGLE_CELL_LOCK in viewer.js).
+  const singleCellCheck = tagControl(check("Single cell only", "singleCell", SINGLE_CELL_TITLE), "cell.single-cell");
+  // Panel size in pixels (also the size of saved images); blank: automatic.
+  const sizeInput = (key) => {
+    const input = el("input", { type: "number", class: "num-input", min: 160, max: 4000, step: 10, placeholder: "auto", "aria-label": `Panel ${key}`,
+      onchange: () => {
+        const value = optionalNumber(input.value);
+        viewerPrefs.panelSize = { ...viewerPrefs.panelSize, [key]: value === null ? null : Math.max(160, Math.min(4000, Math.round(value))) };
+        savePrefs();
+      } });
+    syncs.push(() => { input.value = viewerPrefs.panelSize[key] ?? ""; });
+    return input;
+  };
+  const settingsInput = el("input", { type: "file", accept: ".json,application/json", hidden: true, "aria-label": "Settings file" });
+  settingsInput.addEventListener("change", async () => {
+    const file = settingsInput.files[0];
+    settingsInput.value = "";
+    if (!file) return;
+    let parsed;
+    try { parsed = JSON.parse(await file.text()); } catch { parsed = null; }
+    if (!parsed || parsed.stoms_viewer_settings !== 1 || typeof parsed.settings !== "object") {
+      window.alert(`${file.name} is not a STOMS viewer settings file.`);
+      return;
+    }
+    replacePrefs(fillCutoffs(normalizePrefs(parsed.settings)));
+    if (parsed.view) applyCamera(parsed.view);
+    if (Array.isArray(parsed.measurements)) measureState.items = validMeasurements(parsed.measurements);
+    syncExternal();
+    refresh();
+  });
+  // Slice, element styles, bond cutoffs, polyhedron centres and planes: the
+  // structure page's controls (see createSliceTable and the others). They
+  // save the settings themselves, which redraws (data.saved).
+  function structureSettings() {
+    const redraw = () => {};
+    const shownBoxes = createElementBoxes("hiddenElements", species, redraw, "Show");
+    const sliceTable = createSliceTable("slice", redraw);
+    externals.push(() => syncSliceControls("slice", "hiddenElements", sliceTable, shownBoxes, species));
+    // Element colours also colour the swatches.
+    const swatches = () => document.querySelectorAll(".swatch[data-element]").forEach((swatch) => {
+      swatch.style.background = elementColor(swatch.dataset.element);
+    });
+    const styles = createElementStyles(species, { onColour: swatches, onRadius: redraw });
+    const cutoffs = createCutoffControls(species, redraw);
+    const bondSearch = createBondSearchControls(redraw);
+    const centres = createCentreControls(species, redraw);
+    const planes = createPlaneControls(() => frames[index].cell, redraw, redraw, { structures: () => [frames[index]], measure: () => measure });
+    measure.listen(planes.update);
+    externals.push(() => { styles.refresh(); swatches(); }, cutoffs.refresh, bondSearch.refresh, centres.refresh, planes.refresh);
+    // Controls single cell only locks (they keep their settings).
+    syncs.push(bondSearch.syncOutside, planes.syncLocks);
+    const anyMetal = species.some((s) => !NONMETALS.has(s));
+    return [
+      fieldset("Slice",
+        tagControl(field("Shown elements", shownBoxes), "slice.elements"),
+        el("span", { class: "field-label", "data-control": "slice.bounds" }, "Fractional coordinates"), tagControl(sliceTable, "slice.bounds"),
+        el("div", { class: "button-row" }, tagControl(button("Show all", "Show every element and the whole cell", () => {
+          resetSliceControls("slice", "hiddenElements", sliceTable, shownBoxes, species);
+        }), "slice.show-all"))),
+      fieldset("Elements",
+        el("table", { class: "stats cutoffs radii" },
+          el("thead", {}, el("tr", {}, el("th", {}, ""), el("th", {}, "colour"), el("th", {}, "radius (Å)"), el("th", {}, ""))),
+          styles.element),
+        el("p", { class: "muted hint" }, "Blank radius: automatic (Size scales it in ball and stick)."),
+        el("details", {}, el("summary", {}, "Bond cutoffs"), cutoffs.element,
+          el("p", { class: "muted hint" }, "Bonds from Min up to Max long are drawn."),
+          tagControl(button("Reset cutoffs", "Default cutoffs (1.15 × covalent radii; none between metals) and no minimums", cutoffs.reset), "bonds.reset-cutoffs")),
+        el("details", {}, el("summary", {}, "Bond search"), bondSearch.hbonds, bondSearch.outside),
+        anyMetal ? el("details", {}, el("summary", {}, "Polyhedron centres"), centres.element) : null),
+      fieldset("Planes", planes.element, tagControl(appearanceSlider("Plane opacity", "planeAlpha"), "appearance.plane-opacity")),
+    ];
+  }
+  // The reference of displacements (arrows and colours), from viewer.js.
+  function displacementReferenceControls() {
+    const controls = createDisplacementControls({ compared: false, count: () => frames.length, onChange: () => {} });
+    syncs.push(controls.sync);
+    return controls.element;
+  }
+  // Colour atoms: the structure page's property and colour map controls.
+  function colourSettings() {
+    const properties = createPropertyControls(colourOptions, () => {});
+    // The displacements' reference, when they colour the atoms.
+    const reference = canDisplace ? displacementReferenceControls() : null;
+    if (reference) {
+      syncs.push(() => {
+        const choice = viewerPrefs.property.choice;
+        reference.hidden = !(colouring() && choice?.source === "derived" && choice.name === "displacement");
+      });
+    }
+    const palette = createPaletteControls(() => refresh());
+    const mode = el("select", { "aria-label": "Colour mode", onchange: () => { viewerPrefs.colour = mode.value; savePrefs(); } },
+      el("option", { value: "element" }, "Element colours"), el("option", { value: "property" }, "Atomic property"));
+    syncs.push(() => {
+      mode.value = colouring() ? "property" : "element";
+      properties.element.hidden = !colouring();
+      properties.refresh();
+      palette.refresh();
+    });
+    return fieldset("Colour atoms", tagControl(field("Colour by", mode), "colour.mode"), properties.element, reference, palette.element);
+  }
+  // Arrows: which vectors, their length (Å per unit, or Auto), width, the
+  // smallest drawn, and colour (blank: the text colour).
+  function arrowSettings() {
+    const number = (label, key, { min = 0, step = "any" } = {}) => {
+      const input = el("input", { type: "number", min, step, class: "num-input", "aria-label": label,
+        onchange: () => {
+          const value = Number(input.value);
+          if (key === "minMagnitude") viewerPrefs.arrows.minMagnitude = value > 0 ? value : 0;
+          else if (value > 0) viewerPrefs.arrows[key] = value;
+          savePrefs();
+        } });
+      syncs.push(() => { input.value = viewerPrefs.arrows[key]; });
+      return input;
+    };
+    // The vector columns, and with two frames the displacements.
+    const vectorSelect = el("select", { "aria-label": "Arrow vectors", onchange: () => {
+      if (vectorSelect.value === "displacement") {
+        viewerPrefs.arrows.source = "displacement";
+      } else {
+        const v = vectorChoices[Number(vectorSelect.value)];
+        viewerPrefs.arrows.source = "vectors";
+        viewerPrefs.forceChoice = { source: v.source, name: v.name };
+      }
+      savePrefs();
+    } }, vectorChoices.map((v, k) => el("option", { value: k }, `${v.name}${v.unit ? ` (${v.unit})` : ""}${v.source === "calculator" ? "" : ` · ${v.source}`}`)),
+    canDisplace ? el("option", { value: "displacement" }, "Displacement (Å)") : null);
+    syncs.push(() => {
+      vectorSelect.value = arrowSource() === "displacement" ? "displacement" : String(Math.max(0, vectorChoices.indexOf(chosenVector())));
+    });
+    const reference = canDisplace ? displacementReferenceControls() : null;
+    if (reference) syncs.push(() => { reference.hidden = arrowSource() !== "displacement"; });
+    const colour = el("input", { type: "color", "aria-label": "Arrow colour", oninput: () => { viewerPrefs.arrows.colour = colour.value; savePrefs(); } });
+    syncs.push(() => { colour.value = viewerPrefs.arrows.colour ?? themeTextColour(); });
+    return fieldset("Arrows",
+      tagControl(check("Show arrows", "arrows", "Arrows of the per-atom vectors", "show"), "arrows.show"),
+      vectorChoices.length + canDisplace > 1 ? tagControl(field("Vectors", vectorSelect), "arrows.vectors") : null,
+      reference,
+      tagControl(field("Length (Å per unit)", el("span", { class: "inline-fields" }, number("Arrow length scale", "scale"),
+        button("Auto", "Largest vector of all frames → 1.5 Å arrow", () => {
+          const scale = autoArrowScale();
+          if (scale) { viewerPrefs.arrows.scale = scale; savePrefs(); }
+        }))), "arrows.length"),
+      tagControl(field("Width (Å)", number("Arrow width", "width", { min: 0.01, step: 0.01 })), "arrows.width"),
+      tagControl(field("Hide below", number("Smallest vector drawn", "minMagnitude")), "arrows.min-magnitude"),
+      tagControl(field("Colour", el("span", { class: "inline-fields" }, colour,
+        button("Theme", "The page's text colour", () => { viewerPrefs.arrows.colour = null; savePrefs(); }))), "arrows.colour"));
+  }
+  // Drawing style and radius type (STYLES, RADIUS_TYPES in viewer.js), and
+  // the polyhedra, which space-filling leaves out.
+  function styleSettings() {
+    const radiusType = tagControl(choice("Radius type", RADIUS_TYPES.map((value) => [value, RADIUS_TYPE_LABELS[value]]),
+      () => viewerPrefs.radiusType, (value) => { viewerPrefs.radiusType = value; }), "style.radius-type");
+    const polyhedra = tagControl(check("Coordination polyhedra", "polyhedra", "Polyhedra around transition-metal atoms"), "polyhedra.show");
+    const centres = tagControl(check("Show centre atoms", "polyhedraCentres", "Draw the atoms at the centre of the polyhedra"), "polyhedra.centre-atoms");
+    syncs.push(() => {
+      const locks = styleLocks();
+      lockable(radiusType, locks.radiusType);
+      lockable(polyhedra, locks.polyhedra);
+      lockable(centres, locks.polyhedraCentres);
+      refreshRadiusInputs();
+    });
+    return [
+      tagControl(choice("Model", STYLES.map((value) => [value, STYLE_LABELS[value]]), () => viewerPrefs.style, (value) => { viewerPrefs.style = value; }),
+        "style.model"),
+      radiusType, polyhedra, centres,
+    ];
+  }
+  // Cell outline: width, colour (null = the theme's) and line style.
+  function cellSettings() {
+    const themeCell = () => themeColours(panel.stage).cell;
+    const colour = el("input", { type: "color", "aria-label": "Cell outline colour",
+      oninput: () => { viewerPrefs.appearance.cellColour = colour.value; savePrefs(); } });
+    syncs.push(() => { colour.value = viewerPrefs.appearance.cellColour ?? themeCell(); });
+    // The outline at every copy: off while the outline is.
+    const everyCopy = tagControl(check("Outline every copy", "repeatCellOutline", EVERY_COPY_TITLE), "cell.outline-every-copy");
+    syncs.push(() => {
+      // Shown unticked with single cell only: one cell, no copies to outline.
+      if (viewerPrefs.singleCell) everyCopy.querySelector("input").checked = false;
+      lockable(everyCopy, singleCellLock() ?? (viewerPrefs.cell ? null : "The cell outline is off"));
+    });
+    return [
+      everyCopy,
+      tagControl(appearanceSlider("Cell outline width", "cellWidth", { min: 0.5, max: MAX_CELL_WIDTH, step: 0.5, format: (value) => `${value} px` }),
+        "cell.outline-width"),
+      tagControl(field("Cell outline colour", el("span", { class: "inline-fields" }, colour,
+        button("Theme", "The theme's cell colour", () => { viewerPrefs.appearance.cellColour = null; savePrefs(); }))), "cell.outline-colour"),
+      tagControl(choice("Cell outline style", Object.keys(CELL_DASHES).map((value) => [value, value]),
+        () => viewerPrefs.appearance.cellDash, (value) => { viewerPrefs.appearance.cellDash = value; }), "cell.outline-style"),
+    ];
+  }
+  // Symmetry (stoms.analysis.symmetry, embedded by Python): the shown
+  // frame's space group and the tolerance; without spglib one line naming
+  // the extra.
+  function symmetrySettings() {
+    if (!frames.some(symmetryAvailable)) return fieldset("Symmetry", el("p", { class: "muted hint symmetry-hint" }, SYMMETRY_INSTALL));
+    // A result: GUI profiles never hide it (see applyProfile).
+    const summary = el("p", { class: "symmetry-summary", "data-profile-content": "" });
+    syncs.push(() => {
+      const s = frames[index];
+      const sym = symmetryNow(s);
+      summary.textContent = symmetryError ? symmetryError
+        : !sym ? "Space group: …"
+        : sym.number != null ? `Space group ${spaceGroupText(sym)}, ${sym.crystal_system}`
+        : `Space group: ${spaceGroupText(sym)}${sym.reason ? ` (${sym.reason})` : ""}`;
+    });
+    const tolerance = el("input", { type: "number", class: "num-input", min: MIN_SYMMETRY_TOLERANCE, max: MAX_SYMMETRY_TOLERANCE, step: 0.001,
+      "aria-label": "Symmetry tolerance", onchange: () => {
+        const value = Number(tolerance.value);
+        if (value >= MIN_SYMMETRY_TOLERANCE && value <= MAX_SYMMETRY_TOLERANCE) { viewerPrefs.symmetry.tolerance = value; savePrefs(); }
+        else tolerance.value = viewerPrefs.symmetry.tolerance;
+      } });
+    syncs.push(() => { tolerance.value = viewerPrefs.symmetry.tolerance; });
+    return fieldset("Symmetry", summary,
+      tagControl(field("Tolerance (Å)", tolerance, "Distance tolerance of the symmetry search (spglib's symprec)"), "symmetry.tolerance"),
+      el("p", { class: "muted hint" }, "Hover over an atom for its Wyckoff letter; Colour › Atomic property › Equivalent site colours the inequivalent sites."));
+  }
+  const settingsFile = () => ({ stoms_viewer_settings: 1, settings: viewerPrefs, view: cameraState(), measurements: measureState.items });
+  // Optional sections are null (no arrows without vectors or two frames).
+  settingsBox.append(...[
+    fieldset("Structure",
+      anyPeriodic ? singleCellCheck : null,
+      anyPeriodic ? tagControl(field("Repeat a × b × c", el("span", { class: "inline-fields" }, ...repeatInputs)), "cell.repeat") : null,
+      anyPeriodic ? repeatMatrix.element : null,
+      ...cellSettings(),
+      tagControl(choice("Atom labels", [["off", "none"], ["index", "index"], ["element", "element"], ["element-index", "element + index"]],
+        () => viewerPrefs.labels, (value) => { viewerPrefs.labels = value; }), "labels.mode"),
+      ...styleSettings(),
+      tagControl(appearanceSlider("Polyhedra opacity", "polyAlpha"), "appearance.polyhedra-opacity"),
+      tagControl(appearanceSlider("Bond radius", "bondRadius", { min: 0.02, max: 0.4, step: 0.01, format: (value) => `${value.toFixed(2)} Å` }),
+        "appearance.bond-radius"),
+      tagControl(check("Depth cueing", "appearance", "Fade atoms towards the back", "depthCue"), "appearance.depth-cue"),
+      tagControl(appearanceSlider("Depth fade at the back", "depthStrength", { min: 0.1, max: 0.9 }), "appearance.depth-strength")),
+    colourSettings(),
+    symmetrySettings(),
+    ...structureSettings(),
+    vectorChoices.length || canDisplace ? arrowSettings() : null,
+    fieldset("Axes and images",
+      tagControl(choice("Axes", [["abc", "cell a, b, c"], ["xyz", "x, y, z"], ["both", "both"], ["off", "none"]],
+        () => viewerPrefs.tripod.axes, setTripodAxes), "axes.tripod"),
+      tagControl(appearanceSlider("Axes size", "size", { min: TRIPOD_SIZES.min, max: TRIPOD_SIZES.max, step: 0.25, group: "tripod" }), "axes.size"),
+      tagControl(appearanceSlider("Axis arrows", "axesSize", { min: TRIPOD_PART_SIZES.min, max: TRIPOD_PART_SIZES.max, step: 0.1, group: "tripod" }), "axes.axes-size"),
+      // q and v_g only exist for vibrational modes of a periodic structure.
+      frames.some((f) => f.has_modes && f.pbc.some(Boolean))
+        ? tagControl(appearanceSlider("q, v_g arrows", "waveSize", { min: TRIPOD_PART_SIZES.min, max: TRIPOD_PART_SIZES.max, step: 0.1, group: "tripod" }), "axes.wave-size")
+        : null,
+      tagControl(check("Axes in saved images", "tripod", "Draw the axes in saved SVG images", "export"), "axes.in-images"),
+      tagControl(check("Transparent background", "svgTransparent", "Saved SVG images without a background, in light colours"), "save.transparent"),
+      tagControl(field("Panel width × height (px)", el("span", { class: "inline-fields" }, sizeInput("width"), sizeInput("height")),
+        "Also the size of saved images; blank: automatic"), "embed.panel-size")),
+    fieldset("Settings",
+      el("div", { class: "button-row" },
+        tagControl(button("Export", "Save these settings and the view to a file", () => {
+          downloadText("stoms-viewer-settings.json", `${JSON.stringify(settingsFile(), null, 2)}\n`, "application/json");
+        }), "settings.export-import"),
+        tagControl(button("Import", "Load settings from a file (also from the ledger viewer)", () => settingsInput.click()), "settings.export-import"),
+        settingsInput,
+        tagControl(button("Save HTML", "Save this viewer as a standalone HTML file", () => {
+          downloadText(`${fileStem()}.html`, standaloneDocument(), "text/html");
+        }), "embed.save-html"),
+        tagControl(button("Reset view", "Top view, fitted", () => {
+          Object.assign(sharedView, { R: presetRotation(frames[index], "top"), scale: null, pan: [0, 0] });
+          viewChanged();
+        }), "embed.reset-view")))].filter(Boolean));
+
+  // ------------------------------------------------------------ profile
+
+  // Which controls are shown (createProfileView in viewer.js): the whole
+  // viewer, toolbar and boxes; the switch sits at the top of ⚙ (the ⚙
+  // button itself is never hidden).
+  // The count of advanced settings in use beside the switch: its list jumps
+  // to them, opening ⚙ (or 📏) when closed.
+  const profileView = createProfileView(root, { profile: data.profile, context: embedControlContext, open: (node) => {
+    if (settingsBox.contains(node) && settingsBox.hidden) settingsButton.click();
+    if (measureBox.contains(node) && measureBox.hidden) measureButton.click();
+  } });
+  settingsBox.prepend(el("div", { class: "profile-row" }, el("span", { class: "field-label" }, "Controls"), createProfileSwitch(profileView),
+    ...createProfileCount(profileView)));
+  profileView.listeners.add((profile) => post({ type: "profile", profile }));
+
+  // ------------------------------------------------------------ pop-out
+
+  const scriptJson = (value) => JSON.stringify(value).replace(/</g, "\\u003c").replace(/>/g, "\\u003e").replace(/&/g, "\\u0026")
+    .replace(/\u2028/g, "\\u2028").replace(/\u2029/g, "\\u2029");
+  // This page as loaded, with the current frame, settings and view; not
+  // linked to the notebook.
+  function standaloneDocument() {
+    const doc = new DOMParser().parseFromString(pristine, "text/html");
+    const state = { ...data, frame: index, settings: viewerPrefs, camera: cameraState(), profile: profileView.profile, bridge: false,
+      api: Object.fromEntries(replies), measurements: measureState.items };
+    doc.getElementById("stoms-data").textContent = scriptJson(state);
+    return `<!doctype html>\n${doc.documentElement.outerHTML}`;
+  }
+  function popOut() {
+    // Not revoked: the tab may be reloaded.
+    const url = URL.createObjectURL(new Blob([standaloneDocument()], { type: "text/html" }));
+    if (!window.open(url, "_blank")) {
+      status.textContent = "The browser did not open a new tab (pop-ups blocked?); ⚙ › Save HTML saves the viewer as a file instead.";
+    }
+  }
+
+  // ------------------------------------------------------------ keys and messages
+
+  window.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && measure.cancel()) { event.preventDefault(); return; }
+    if (event.target.closest?.("input, select, textarea") || event.ctrlKey || event.metaKey || event.altKey) return;
+    if (event.key === "ArrowLeft" && frames.length > 1) { step(-1); event.preventDefault(); }
+    else if (event.key === "ArrowRight" && frames.length > 1) { step(1); event.preventDefault(); }
+  });
+
+  if (bridge) {
+    window.addEventListener("message", (event) => {
+      const m = event.data;
+      if (event.source !== window.parent || !m || !m.stoms) return;
+      if (m.type === "view") setView(m.name, false);
+      else if (m.type === "profile") profileView.set(m.profile);
+      else if (m.type === "api") replied(m);
+      else if (m.type === "state") {
+        if (m.settings && typeof m.settings === "object") {
+          const next = fillCutoffs(normalizePrefs(m.settings));
+          if (JSON.stringify(next) !== JSON.stringify(viewerPrefs)) { replacePrefs(next); syncExternal(); }
+        }
+        if (m.camera && typeof m.camera === "object" && JSON.stringify(m.camera) !== JSON.stringify(cameraState())) applyCamera(m.camera);
+        if (m.frame !== undefined && m.frame !== null) { stop(); index = clampFrame(m.frame); }
+        if (typeof m.profile === "string") profileView.set(m.profile);
+        // Draw now, so the snapshot of this state follows at once.
+        applySize();
+        showFrame(index);
+      }
+    });
+  }
+  if (framed) {
+    new ResizeObserver(() => post({ type: "size", height: Math.ceil(document.documentElement.getBoundingClientRect().height) }))
+      .observe(document.body);
+  }
+
+  // ------------------------------------------------------------ vibrations
+
+  // A structure with modes (stoms.viewer.view_phonons): the structure page's
+  // vibration panel, and with phonons its band structure and DOS.
+  async function showVibrations() {
+    const s = frames[index];
+    if (!s.has_modes) return;
+    document.body.classList.toggle("has-phonons", Boolean(s.has_phonons));
+    vibrationBox.hidden = false;
+    vibrationBox.replaceChildren(el("h3", {}, "Vibrations"), el("p", { class: "muted" }, "Loading the modes…"));
+    let modes;
+    try {
+      modes = await api(`structures/${encodeURIComponent(s.id)}/modes`);
+    } catch (error) {
+      modes = { error: error.message };
+    }
+    const vibration = createVibrationPanel({ structure: s, modes, figures, panel: () => panel, disposed: () => false, repeatChanged: sync });
+    // Apply (a repeat for this q) is locked with single cell only.
+    if (vibration.syncApply) syncs.push(vibration.syncApply);
+    vibrationBox.replaceChildren(el("h3", {}, "Vibrations"), el("div", { class: "embed-vibration-controls" }, ...vibration.controls));
+  }
+
+  applySize();
+  showFrame(index);
+  showVibrations();
+  if (bridge) post({ type: "ready" });
+})();

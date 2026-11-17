@@ -1,0 +1,190 @@
+{
+  "about": "Profile files (GUI profiles, format version 1) and what checkProfileFile (viewer.js) and check_profile_file (stoms.viewer.profiles) make of them: the profile and warnings, or the error message. Both run every case (tests/test_viewer_profile_file.py) against this registry.",
+  "registry": {
+    "ids": ["view.one", "view.two", "embed.never", "cell.new"],
+    "aliases": {"cell.old": "cell.new"},
+    "neverHide": ["embed.never"]
+  },
+  "cases": [
+    {
+      "title": "empty controls (every control by its level)",
+      "doc": {"stomsProfile": 1, "name": "plain", "controls": {}},
+      "profile": {"stomsProfile": 1, "name": "plain", "controls": {}},
+      "warnings": []
+    },
+    {
+      "title": "shown and hidden controls",
+      "doc": {"stomsProfile": 1, "name": "mine", "controls": {"view.one": true, "view.two": false}},
+      "profile": {"stomsProfile": 1, "name": "mine", "controls": {"view.one": true, "view.two": false}},
+      "warnings": []
+    },
+    {
+      "title": "format version written as 1.0",
+      "doc": {"stomsProfile": 1.0, "name": "float", "controls": {"view.one": true}},
+      "profile": {"stomsProfile": 1, "name": "float", "controls": {"view.one": true}},
+      "warnings": []
+    },
+    {
+      "title": "unknown IDs ignored, also names of object properties",
+      "doc": {"stomsProfile": 1, "name": "newer", "controls": {"view.one": false, "future.thing": true, "constructor": true, "__proto__": false, "toString": true}},
+      "profile": {"stomsProfile": 1, "name": "newer", "controls": {"view.one": false}},
+      "warnings": [
+        "Unknown control \"future.thing\" ignored (from a newer STOMS, or a typo).",
+        "Unknown control \"constructor\" ignored (from a newer STOMS, or a typo).",
+        "Unknown control \"__proto__\" ignored (from a newer STOMS, or a typo).",
+        "Unknown control \"toString\" ignored (from a newer STOMS, or a typo)."
+      ]
+    },
+    {
+      "title": "an old ID counts as its new one",
+      "doc": {"stomsProfile": 1, "name": "old", "controls": {"cell.old": false}},
+      "profile": {"stomsProfile": 1, "name": "old", "controls": {"cell.new": false}},
+      "warnings": []
+    },
+    {
+      "title": "the new ID wins over its old one (old first)",
+      "doc": {"stomsProfile": 1, "name": "both", "controls": {"cell.old": true, "cell.new": false}},
+      "profile": {"stomsProfile": 1, "name": "both", "controls": {"cell.new": false}},
+      "warnings": []
+    },
+    {
+      "title": "the new ID wins over its old one (new first)",
+      "doc": {"stomsProfile": 1, "name": "both", "controls": {"cell.new": false, "cell.old": true}},
+      "profile": {"stomsProfile": 1, "name": "both", "controls": {"cell.new": false}},
+      "warnings": []
+    },
+    {
+      "title": "a control no profile hides: false ignored, true kept",
+      "doc": {"stomsProfile": 1, "name": "never", "controls": {"embed.never": false, "view.one": true}},
+      "profile": {"stomsProfile": 1, "name": "never", "controls": {"view.one": true}},
+      "warnings": ["Control \"embed.never\" cannot be hidden by a profile; false ignored."]
+    },
+    {
+      "title": "a control no profile hides, listed as shown",
+      "doc": {"stomsProfile": 1, "name": "never", "controls": {"embed.never": true}},
+      "profile": {"stomsProfile": 1, "name": "never", "controls": {"embed.never": true}},
+      "warnings": []
+    },
+    {
+      "title": "other top-level fields ignored",
+      "doc": {"stomsProfile": 1, "name": "extra", "description": "from a newer STOMS", "base": "advanced", "controls": {}},
+      "profile": {"stomsProfile": 1, "name": "extra", "controls": {}},
+      "warnings": []
+    },
+    {
+      "title": "any non-empty name",
+      "doc": {"stomsProfile": 1, "name": "Phonons é 🎵", "controls": {}},
+      "profile": {"stomsProfile": 1, "name": "Phonons é 🎵", "controls": {}},
+      "warnings": []
+    },
+    {"title": "a list", "doc": [], "error": "Invalid STOMS profile: expected a JSON object, got a list."},
+    {"title": "a string", "doc": "simple", "error": "Invalid STOMS profile: expected a JSON object, got a string."},
+    {"title": "null", "doc": null, "error": "Invalid STOMS profile: expected a JSON object, got null."},
+    {"title": "a number", "doc": 1, "error": "Invalid STOMS profile: expected a JSON object, got a number."},
+    {
+      "title": "no format version",
+      "doc": {"name": "x", "controls": {}},
+      "error": "Invalid STOMS profile: \"stomsProfile\" (the format version) is missing."
+    },
+    {
+      "title": "format version as a string",
+      "doc": {"stomsProfile": "1", "name": "x", "controls": {}},
+      "error": "Invalid STOMS profile: \"stomsProfile\" must be the number 1, got a string."
+    },
+    {
+      "title": "format version true",
+      "doc": {"stomsProfile": true, "name": "x", "controls": {}},
+      "error": "Invalid STOMS profile: \"stomsProfile\" must be the number 1, got a boolean."
+    },
+    {
+      "title": "format version null",
+      "doc": {"stomsProfile": null, "name": "x", "controls": {}},
+      "error": "Invalid STOMS profile: \"stomsProfile\" must be the number 1, got null."
+    },
+    {
+      "title": "a newer format version",
+      "doc": {"stomsProfile": 2, "name": "x", "controls": {}},
+      "error": "Invalid STOMS profile: this STOMS reads format version 1 only (\"stomsProfile\": 1)."
+    },
+    {
+      "title": "format version 0",
+      "doc": {"stomsProfile": 0, "name": "x", "controls": {}},
+      "error": "Invalid STOMS profile: this STOMS reads format version 1 only (\"stomsProfile\": 1)."
+    },
+    {
+      "title": "format version 1.5",
+      "doc": {"stomsProfile": 1.5, "name": "x", "controls": {}},
+      "error": "Invalid STOMS profile: this STOMS reads format version 1 only (\"stomsProfile\": 1)."
+    },
+    {
+      "title": "no name",
+      "doc": {"stomsProfile": 1, "controls": {}},
+      "error": "Invalid STOMS profile: \"name\" is missing."
+    },
+    {
+      "title": "a number as name",
+      "doc": {"stomsProfile": 1, "name": 5, "controls": {}},
+      "error": "Invalid STOMS profile: \"name\" must be a string, got a number."
+    },
+    {
+      "title": "name null",
+      "doc": {"stomsProfile": 1, "name": null, "controls": {}},
+      "error": "Invalid STOMS profile: \"name\" must be a string, got null."
+    },
+    {
+      "title": "empty name",
+      "doc": {"stomsProfile": 1, "name": "", "controls": {}},
+      "error": "Invalid STOMS profile: \"name\" is empty."
+    },
+    {
+      "title": "no controls",
+      "doc": {"stomsProfile": 1, "name": "x"},
+      "error": "Invalid STOMS profile: \"controls\" is missing."
+    },
+    {
+      "title": "controls as a list of IDs",
+      "doc": {"stomsProfile": 1, "name": "x", "controls": ["view.one"]},
+      "error": "Invalid STOMS profile: \"controls\" must be an object of control IDs, got a list."
+    },
+    {
+      "title": "controls null",
+      "doc": {"stomsProfile": 1, "name": "x", "controls": null},
+      "error": "Invalid STOMS profile: \"controls\" must be an object of control IDs, got null."
+    },
+    {
+      "title": "controls as a string",
+      "doc": {"stomsProfile": 1, "name": "x", "controls": "view.one"},
+      "error": "Invalid STOMS profile: \"controls\" must be an object of control IDs, got a string."
+    },
+    {
+      "title": "a control as a string",
+      "doc": {"stomsProfile": 1, "name": "x", "controls": {"view.one": true, "view.two": "yes"}},
+      "error": "Invalid STOMS profile: control \"view.two\" must be true or false, got a string."
+    },
+    {
+      "title": "a control as 1",
+      "doc": {"stomsProfile": 1, "name": "x", "controls": {"view.one": 1}},
+      "error": "Invalid STOMS profile: control \"view.one\" must be true or false, got a number."
+    },
+    {
+      "title": "a control null",
+      "doc": {"stomsProfile": 1, "name": "x", "controls": {"view.one": null}},
+      "error": "Invalid STOMS profile: control \"view.one\" must be true or false, got null."
+    },
+    {
+      "title": "a control as an object",
+      "doc": {"stomsProfile": 1, "name": "x", "controls": {"view.one": {"shown": true}}},
+      "error": "Invalid STOMS profile: control \"view.one\" must be true or false, got an object."
+    },
+    {
+      "title": "an unknown control of the wrong type is an error too",
+      "doc": {"stomsProfile": 1, "name": "x", "controls": {"future.thing": "auto"}},
+      "error": "Invalid STOMS profile: control \"future.thing\" must be true or false, got a string."
+    },
+    {
+      "title": "a wrong type wins over an ignored entry before it",
+      "doc": {"stomsProfile": 1, "name": "x", "controls": {"embed.never": false, "future.thing": true, "view.one": []}},
+      "error": "Invalid STOMS profile: control \"view.one\" must be true or false, got a list."
+    }
+  ]
+}

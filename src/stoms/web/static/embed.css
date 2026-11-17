@@ -1,0 +1,57 @@
+/* The embedded viewer (embed.js): a structure panel with a compact toolbar,
+   on top of app.css. */
+body.embed-page { padding: 2px; overflow-x: auto; overflow-y: hidden; font-size: 13px; }
+body.embed-standalone { padding: .75rem; overflow-y: auto; }
+.embed-panel.fixed-width { width: fit-content; }
+.embed-standalone .embed-panel .viewer-stage { height: calc(100vh - 7.5rem); }
+.embed-bar { display: flex; flex-wrap: wrap; align-items: center; gap: .3rem .75rem; padding: .35rem .1rem 0; font-size: 12px; }
+.embed-bar .group { display: inline-flex; align-items: center; gap: .3rem; }
+.embed-bar label.check { display: inline-flex; align-items: center; gap: .25rem; }
+.embed-bar input[type=range] { width: 5rem; }
+.embed-bar .frame-slider { width: 8rem; }
+.embed-bar .frame-number { width: 3.8rem; }
+.embed-bar select { padding: .15rem .3rem; font-size: 12px; }
+.embed-bar .spacer { flex: 1; }
+.embed-bar button.active { border-color: var(--accent); color: var(--accent); }
+.embed-settings { display: grid; grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr)); gap: .6rem 1.2rem;
+  margin-top: .4rem; padding: .5rem .1rem .2rem; border-top: 1px solid var(--border); font-size: 12px; }
+.embed-settings[hidden] { display: none; }
+.embed-settings fieldset { display: grid; gap: .35rem; align-content: start; margin: 0; padding: 0; border: 0; }
+.embed-settings legend { padding: 0; margin-bottom: .2rem; font-weight: 600; }
+.embed-settings label.check { display: flex; align-items: center; gap: .35rem; }
+.embed-settings .field { display: grid; gap: .15rem; }
+.embed-settings .inline-fields { display: flex; gap: .3rem; }
+.embed-settings .num-input { width: 4.5rem; }
+.embed-settings .matrix-row .num-input { width: 3.2rem; }
+.embed-settings .button-row { display: flex; flex-wrap: wrap; gap: .3rem; }
+.embed-status { padding: .25rem .1rem 0; font-size: 12px; }
+/* Vibrations (view_phonons): the structure page's panel, in the flow of the page. */
+.embed-vibrations { position: static; max-height: none; overflow: visible; margin-top: .5rem; }
+.embed-vibrations[hidden] { display: none; }
+.embed-vibrations h3 { margin-top: .2rem; }
+.embed-vibration-controls { display: grid; grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr)); gap: .3rem 1.2rem; align-items: start; }
+.embed-vibration-controls .mode-list { width: 100%; }
+/* A tab of its own with a phonon plot: room for the plot below the structure. */
+.embed-standalone.has-phonons .embed-panel .viewer-stage { height: 55vh; }
+/* Measure (📏): the structure page's panel; clicks on atoms measure. */
+.embed-measure { position: static; max-height: none; overflow: visible; margin-top: .5rem; }
+.embed-measure[hidden] { display: none; }
+.embed-measure h3 { margin-top: .2rem; }
+.viewer-figures.measuring .viewer-stage { cursor: crosshair; }
+/* Legend of a property colouring, under the structure. */
+.embed-legend { padding: .3rem .1rem 0; font-size: 12px; }
+.embed-legend:empty { display: none; }
+.embed-settings .error-controls { display: grid; gap: .3rem; }
+.embed-settings .control-section h4 { margin: .2rem 0; font-size: 12px; }
+/* Layout rules above must not show what is hidden (custom palette, ...). */
+.embed-settings [hidden], .embed-bar [hidden] { display: none !important; }
+/* Slice, element and plane controls (the structure page's). */
+.embed-settings table.cutoffs { border-collapse: collapse; }
+.embed-settings table.cutoffs td, .embed-settings table.cutoffs th { padding: .1rem .3rem; text-align: left; }
+.embed-settings .element-boxes { display: flex; flex-wrap: wrap; gap: .2rem .8rem; }
+.embed-settings .plane-row { display: grid; gap: .2rem; margin-bottom: .4rem; }
+.embed-settings .plane-index { width: 3.2rem; }
+.embed-settings .plane-distance { width: 4.4rem; }
+.embed-settings details summary { cursor: pointer; }
+/* The profile switch (Simple | Advanced) at the top of ⚙, across the columns. */
+.embed-settings > .profile-row { grid-column: 1 / -1; }
